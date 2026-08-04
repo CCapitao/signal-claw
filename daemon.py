@@ -629,6 +629,27 @@ def process_drop(drop: dict, rpc: SignalRpc) -> None:
               drop["door"], _reply)
 
 
+def _lfs_route(repo: Path, dest: Path, dest_rel: Path, big: list[str]) -> list[str]:
+    """Fallback lane: carry oversize files in git-lfs when the release lane
+    fails. Size is routing, never rejection (Capitão, 2026-08-04).
+    Returns the routed file names."""
+    if _git(repo, "lfs", "version").returncode != 0:
+        log.error("git-lfs unavailable — %d file(s) stuck in the failed lane", len(big))
+        return []
+    _git(repo, "lfs", "install", "--local")
+    routed: list[str] = []
+    for b in big:
+        name = Path(b).name
+        if _git(repo, "lfs", "track", f"{dest_rel}/{name}").returncode != 0:
+            log.error("lfs track failed for %s/%s", dest_rel, name)
+            continue
+        shutil.copy2(b, dest / name)
+        routed.append(name)
+    if routed:
+        _git(repo, "add", ".gitattributes")
+    return routed
+
+
 def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
               sender: str, door: str, reply) -> None:
     """The door-agnostic spine: stage → commit → issue → manifest → reply.
@@ -685,14 +706,33 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
             push = _git(repo, "push")
         sha = _git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
 
-        # Oversized files ride release assets, never git.
+        # Oversized files ride release assets first; if that lane fails they
+        # route through git-lfs. Size is routing, never rejection (Capitão,
+        # 2026-08-04).
         if big:
             rel = _run([GH_BIN, "release", "create", f"drop-{drop_id}", *big,
                         "-R", RECEIPTS_GH_REPO, "--title", f"Assets: {drop_id}",
                         "--notes", f"Oversize payload files for {drop_id} (>{DROP_RELEASE_MB}MB)."])
             if rel.returncode != 0:
-                log.error("release upload failed: %s", (rel.stderr or "")[:300])
-                rejected.append(f"{len(big)} oversize file(s) failed release upload")
+                log.error("release upload failed: %s — trying lfs route", (rel.stderr or "")[:300])
+                routed = _lfs_route(repo, dest, dest_rel, big)
+                if routed:
+                    names += routed
+                    meta["files"] = names
+                    meta["release_assets"] = [n for n in meta["release_assets"]
+                                              if n not in routed]
+                    meta["lfs"] = routed
+                    (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+                    _git(repo, "add", str(dest_rel))
+                    _git(repo, "commit", "-m",
+                         f"drop({drop_id}): {len(routed)} file(s) via lfs route")
+                    if _git(repo, "push").returncode != 0:
+                        _git(repo, "pull", "--rebase")
+                        _git(repo, "push")
+                    sha = _git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+                unrouted = [Path(b).name for b in big if Path(b).name not in routed]
+                if unrouted:
+                    rejected.append(f"{len(unrouted)} oversize file(s) failed release+lfs routing")
 
         # Labels: hashtag > intake guess > personal.
         prod = next((t for t in tags if t in DROP_PRODS), "")
