@@ -77,6 +77,9 @@ RECEIPTS_GH_REPO  = env("RECEIPTS_GH_REPO", "CCapitao/receipts")  # owner/name f
 DROP_STAGING      = Path(env("DROP_STAGING", str(Path.home() / "drop/inbox")))
 DROP_INTAKE_CONFIG_DIR = env("DROP_INTAKE_CONFIG_DIR", "").strip()  # minimal intake persona (~/.claude-sasuke)
 DROP_RELEASE_MB   = int(env("DROP_RELEASE_MB", "25"))    # bigger than this rides a release asset, not git
+SKULL_REPO        = env("SKULL_REPO", "").strip()        # local clone of skull-and-crown; empty = #lmsr fan-out off
+SKULL_GH_REPO     = env("SKULL_GH_REPO", "CCapitao/skull-and-crown")
+NODE_BIN          = env("NODE_BIN", "/usr/bin/node")     # runs the site's own add-piece intake
 SIGNAL_ATTACH_DIR = Path(env("SIGNAL_ATTACH_DIR", str(Path.home() / ".local/share/signal-cli/attachments")))
 GH_BIN            = env("GH_BIN", "/usr/bin/gh")
 GIT_BIN           = env("GIT_BIN", "/usr/bin/git")
@@ -92,6 +95,16 @@ PULSE_TRIGGER = "pulse-agents"
 # Receipts Drop: hashtag door + label vocab (four axes; hashtags in the note win).
 DROP_HASHTAG_RE = re.compile(r"(?:^|\s)#drop\b", re.IGNORECASE)
 DROP_TAG_RE     = re.compile(r"(?:^|\s)#([a-z0-9][a-z0-9-]*)", re.IGNORECASE)
+
+# Galería de Guadalupe fan-out (Capitão, 2026-09-01): "#lmsr" — Long May She
+# Reign — means this drop is ALSO a gallery piece. It does not bend the standing
+# ruling that filing is not approval: the tag IS Capitão's word, given per drop,
+# on that drop. Receipts stays the system of record and always completes first;
+# the gallery publish is a fail-open second leg that can never undo a filing,
+# and the drop keeps status:receipt (publishing is not promotion).
+LMSR_RE       = re.compile(r"(?:^|\s)#lmsr\b", re.IGNORECASE)
+GALLERY_EXT   = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp", ".gif"}
+GALLERY_ROOMS = {"arte", "merch"}
 DROP_KINDS      = {"receipt", "art", "audio", "note"}
 DROP_PRODS      = {"bfp", "mc", "skull-and-crown", "personal", "mama-carol", "jeep"}
 DROP_EXT_ALLOW  = {".pdf", ".png", ".jpg", ".jpeg", ".heic", ".heif", ".gif", ".webp",
@@ -650,6 +663,63 @@ def _lfs_route(repo: Path, dest: Path, dest_rel: Path, big: list[str]) -> list[s
     return routed
 
 
+def _piece_title(text: str, fallback: str) -> str:
+    """Title for a gallery piece: the note with hashtags stripped, first line."""
+    cleaned = DROP_TAG_RE.sub(" ", text or "")
+    for line in cleaned.splitlines():
+        line = " ".join(line.split())
+        if line:
+            return line[:80]
+    return fallback
+
+
+def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
+                       drop_id: str) -> list[str]:
+    """Second leg for #lmsr drops: hang the images in the Galería de Guadalupe.
+
+    Reuses the site's own scripts/add-piece.mjs so the resize and stub rules
+    live in exactly one place. Returns the published piece paths; raises
+    nothing the caller can't swallow — receipts is already filed by now.
+    """
+    if not SKULL_REPO:
+        log.warning("#lmsr on %s but SKULL_REPO unset — gallery leg skipped", drop_id)
+        return []
+    repo = Path(SKULL_REPO)
+    if not (repo / ".git").exists():
+        log.error("SKULL_REPO %s is not a git clone", repo)
+        return []
+
+    room = next((t for t in tags if t in GALLERY_ROOMS), "arte")
+    images = [n for n in names if Path(n).suffix.lower() in GALLERY_EXT]
+    if not images:
+        log.info("#lmsr on %s but no images in payload — nothing to hang", drop_id)
+        return []
+
+    _git(repo, "pull", "--rebase", "--autostash")
+
+    base = _piece_title(text, drop_id)
+    published: list[str] = []
+    for i, name in enumerate(images):
+        title = base if len(images) == 1 else f"{base} {i + 1}"
+        add = _run([NODE_BIN, "scripts/add-piece.mjs", str(dest / name), title, room],
+                   cwd=str(repo))
+        if add.returncode != 0:
+            log.error("add-piece failed for %s: %s", name, (add.stderr or "")[:300])
+            continue
+        published.append(f"{room}/{(add.stdout or '').strip().splitlines()[0].split('/')[-1]}")
+
+    if not published:
+        return []
+
+    _git(repo, "add", "gallery", "public/gallery")
+    _git(repo, "commit", "-m",
+         f"gallery({drop_id}): {len(published)} piece(s) into {room} via #lmsr")
+    if _git(repo, "push").returncode != 0:
+        _git(repo, "pull", "--rebase")
+        _git(repo, "push")
+    return published
+
+
 def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
               sender: str, door: str, reply) -> None:
     """The door-agnostic spine: stage → commit → issue → manifest → reply.
@@ -805,8 +875,27 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
         except Exception:
             log.exception("auto-link step failed (drop already filed)")
 
+        # Galería leg (#lmsr). Runs last and fails open: receipts is filed,
+        # the issue is open, the manifest is appended — none of that unwinds if
+        # the gallery push trips. The drop keeps status:receipt; hanging a piece
+        # is not promotion.
+        hung: list[str] = []
+        try:
+            if LMSR_RE.search(text or ""):
+                hung = publish_to_galeria(dest, names, text, tags, drop_id)
+                if hung and issue_url:
+                    _run([GH_BIN, "issue", "comment", issue_url, "--body",
+                          "👑 `#lmsr` — also hung in the Galería de Guadalupe: "
+                          + ", ".join(f"`{p}`" for p in hung)
+                          + "\n\nReceipts remains the system of record; this is a"
+                            " publish, not a promotion."])
+        except Exception:
+            log.exception("galería leg failed (drop already filed)")
+
         summary = (f"📥 {drop_id} filed · kind:{kind} · prod:{prod} · "
                    f"{len(names)} file(s) · {issue_url or '(issue failed — logged)'}")
+        if hung:
+            summary += "\n👑 hung in the Galería: " + ", ".join(hung)
         if rejected:
             summary += "\n⚠️ rejected: " + "; ".join(rejected[:3])
         if linked:
