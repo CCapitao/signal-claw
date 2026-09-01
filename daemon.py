@@ -774,7 +774,10 @@ def _piece_title(text: str, fallback: str) -> tuple[str, str]:
     than a slug nobody can read.
     """
     cleaned = " ".join(URL_RE.sub(" ", DROP_TAG_RE.sub(" ", text or "")).split())
-    if not cleaned:
+    # Punctuation-only leftovers are not a title. "#lmsr #28*" strips down to
+    # "*", which slugifies to nothing and used to publish a piece at the room's
+    # own URL. Require at least one letter or digit.
+    if not re.search(r"[A-Za-z0-9]", cleaned):
         return fallback, ""
 
     split = re.search(r"\s+[—–-]\s+|\s*[:;]\s+|(?<=[.!?])\s+", cleaned)
@@ -820,7 +823,13 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
     # becomes the caption rather than falling back to the drop id.
     base, story = _piece_title(text or "", "")
     if not base:
-        base, story = _piece_title(caption, drop_id)
+        base, story = _piece_title(caption, "")
+    if not base:
+        # All hashtags and nothing else: the tags ARE the caption. Drop the ones
+        # that steer the pipeline and keep whatever the Captain was naming.
+        control = GALLERY_ROOMS | DROP_KINDS | DROP_PRODS | {"lmsr", "drop"}
+        words = [t for t in DROP_TAG_RE.findall(text or "") if t.lower() not in control]
+        base = " ".join(words) or drop_id
 
     alts = alts or {}
     published: list[str] = []
