@@ -663,14 +663,31 @@ def _lfs_route(repo: Path, dest: Path, dest_rel: Path, big: list[str]) -> list[s
     return routed
 
 
-def _piece_title(text: str, fallback: str) -> str:
-    """Title for a gallery piece: the note with hashtags stripped, first line."""
-    cleaned = DROP_TAG_RE.sub(" ", text or "")
-    for line in cleaned.splitlines():
-        line = " ".join(line.split())
-        if line:
-            return line[:80]
-    return fallback
+def _piece_title(text: str, fallback: str) -> tuple[str, str]:
+    """Split a drop note into (title, rest) for a gallery piece.
+
+    A caption is usually a name followed by the story — "La Catrina dela Virgen
+    de Guadalupe — The Queen's very own artwork for the gift". Cut at the first
+    em/en dash, colon, or sentence end so the title is the name and the story
+    becomes the note; a bare long line falls back to a word-boundary trim rather
+    than a slug nobody can read.
+    """
+    cleaned = " ".join(DROP_TAG_RE.sub(" ", text or "").split())
+    if not cleaned:
+        return fallback, ""
+
+    split = re.search(r"\s+[—–-]\s+|\s*[:;]\s+|(?<=[.!?])\s+", cleaned)
+    if split:
+        title, rest = cleaned[:split.start()].strip(), cleaned[split.end():].strip()
+    else:
+        title, rest = cleaned, ""
+
+    if len(title) > 60:
+        cut = title[:60].rsplit(" ", 1)[0] or title[:60]
+        rest = (title[len(cut):].strip() + " " + rest).strip()
+        title = cut
+
+    return title.rstrip(" .,;:—–-") or fallback, rest
 
 
 def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
@@ -697,7 +714,7 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
 
     _git(repo, "pull", "--rebase", "--autostash")
 
-    base = _piece_title(text, drop_id)
+    base, story = _piece_title(text, drop_id)
     published: list[str] = []
     for i, name in enumerate(images):
         title = base if len(images) == 1 else f"{base} {i + 1}"
@@ -706,7 +723,16 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
         if add.returncode != 0:
             log.error("add-piece failed for %s: %s", name, (add.stderr or "")[:300])
             continue
-        published.append(f"{room}/{(add.stdout or '').strip().splitlines()[0].split('/')[-1]}")
+        slug = (add.stdout or "").strip().splitlines()[0].split("/")[-1]
+        published.append(f"{room}/{slug}")
+        # The rest of the caption is the wall card's body — the piece keeps its
+        # name in the URL, the Captain's words keep their place under it.
+        if story:
+            piece_md = repo / "gallery" / room / f"{slug}.md"
+            try:
+                piece_md.write_text(piece_md.read_text().rstrip("\n") + f"\n\n{story}\n")
+            except OSError:
+                log.exception("could not append note to %s", piece_md)
 
     if not published:
         return []
@@ -807,6 +833,8 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
         # Labels: hashtag > intake guess > personal.
         prod = next((t for t in tags if t in DROP_PRODS), "")
         desc, prod_guess = _intake_describe(dest, text, kind)
+        if not prod and LMSR_RE.search(text or ""):
+            prod = "skull-and-crown"   # #lmsr means it's hers — label it hers
         if not prod:
             prod = prod_guess or "personal"
         if not desc:
