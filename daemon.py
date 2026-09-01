@@ -79,7 +79,7 @@ DROP_INTAKE_CONFIG_DIR = env("DROP_INTAKE_CONFIG_DIR", "").strip()  # minimal in
 DROP_RELEASE_MB   = int(env("DROP_RELEASE_MB", "25"))    # bigger than this rides a release asset, not git
 SKULL_REPO        = env("SKULL_REPO", "").strip()        # local clone of skull-and-crown; empty = #lmsr fan-out off
 SKULL_GH_REPO     = env("SKULL_GH_REPO", "CCapitao/skull-and-crown")
-NODE_BIN          = env("NODE_BIN", "/usr/bin/node")     # runs the site's own add-piece intake
+BUN_BIN           = env("BUN_BIN", str(Path.home() / ".bun/bin/bun"))  # runs the site's own add-piece intake
 SIGNAL_ATTACH_DIR = Path(env("SIGNAL_ATTACH_DIR", str(Path.home() / ".local/share/signal-cli/attachments")))
 GH_BIN            = env("GH_BIN", "/usr/bin/gh")
 GIT_BIN           = env("GIT_BIN", "/usr/bin/git")
@@ -718,7 +718,7 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
     published: list[str] = []
     for i, name in enumerate(images):
         title = base if len(images) == 1 else f"{base} {i + 1}"
-        add = _run([NODE_BIN, "scripts/add-piece.mjs", str(dest / name), title, room],
+        add = _run([BUN_BIN, "scripts/add-piece.mjs", str(dest / name), title, room],
                    cwd=str(repo))
         if add.returncode != 0:
             log.error("add-piece failed for %s: %s", name, (add.stderr or "")[:300])
