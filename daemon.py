@@ -24,6 +24,7 @@ All configuration is taken from environment variables (see config.example.env).
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -105,6 +107,16 @@ DROP_TAG_RE     = re.compile(r"(?:^|\s)#([a-z0-9][a-z0-9-]*)", re.IGNORECASE)
 LMSR_RE       = re.compile(r"(?:^|\s)#lmsr\b", re.IGNORECASE)
 GALLERY_EXT   = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp", ".gif"}
 GALLERY_ROOMS = {"arte", "merch"}
+
+# URL door: a drop can carry a link instead of a file. A Mastodon status URL is
+# resolved through the instance's public API (no auth for public posts) so the
+# toot's images — and their alt text — come down with it; a direct image URL is
+# fetched as-is. Everything fetched is DATA: the post's text never instructs.
+URL_RE        = re.compile(r"https://[^\s<>\"')]+", re.IGNORECASE)
+MASTO_RE      = re.compile(r"^https://([^/]+)/(?:@[^/]+|users/[^/]+/statuses)/(\d+)/?$", re.IGNORECASE)
+FETCH_MB      = int(env("DROP_FETCH_MB", "25"))          # hard cap per fetched file
+FETCH_TIMEOUT = int(env("DROP_FETCH_TIMEOUT", "30"))
+FETCH_UA      = "signal-claw/1.0 (+https://theskullandcrown.com)"
 DROP_KINDS      = {"receipt", "art", "audio", "note"}
 DROP_PRODS      = {"bfp", "mc", "skull-and-crown", "personal", "mama-carol", "jeep"}
 DROP_EXT_ALLOW  = {".pdf", ".png", ".jpg", ".jpeg", ".heic", ".heif", ".gif", ".webp",
@@ -513,6 +525,76 @@ def extract_drop(envelope: dict) -> dict | None:
     return None
 
 
+def _http_get(url: str, *, want_json: bool = False):
+    """Fetch a URL with a cap and a timeout. Returns (bytes, content_type) or
+    parsed JSON. https only — no redirects to other schemes, no local files."""
+    if not url.lower().startswith("https://"):
+        raise ValueError(f"refusing non-https url: {url[:80]}")
+    req = urllib.request.Request(url, headers={"User-Agent": FETCH_UA})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+        if not resp.url.lower().startswith("https://"):
+            raise ValueError("redirected off https")
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        body = resp.read(FETCH_MB * 1024 * 1024 + 1)
+    if len(body) > FETCH_MB * 1024 * 1024:
+        raise ValueError(f"remote file exceeds {FETCH_MB}MB")
+    if want_json:
+        return json.loads(body.decode("utf-8"))
+    return body, ctype
+
+
+def _fetch_image(url: str, stem: str, into: Path) -> tuple[Path, str] | None:
+    """Download one image to `into`. Content-type decides the extension, so a
+    link that isn't actually an image is dropped rather than guessed at."""
+    try:
+        body, ctype = _http_get(url)
+    except Exception as e:
+        log.warning("url door: fetch failed for %s: %s", url[:100], e)
+        return None
+    ext = CT_EXT.get(ctype, "")
+    if ext.lower() not in GALLERY_EXT:
+        log.warning("url door: %s is %s, not an allowed image", url[:100], ctype or "unknown")
+        return None
+    path = into / f"{_safe_name(stem)}{ext}"
+    path.write_bytes(body)
+    return path, path.name
+
+
+def fetch_from_urls(text: str, into: Path) -> list[tuple[Path, str, str, str]]:
+    """Pull images named by links in the drop note.
+
+    Returns [(local_path, dest_name, alt_text, caption)]. A Mastodon status URL
+    resolves through the instance API so alt text and the toot's own words come
+    along; any other https link is tried as a direct image.
+    """
+    found: list[tuple[Path, str, str, str]] = []
+    for url in dict.fromkeys(URL_RE.findall(text or "")):
+        url = url.rstrip(".,;)")
+        masto = MASTO_RE.match(url)
+        if masto:
+            host, status_id = masto.group(1), masto.group(2)
+            try:
+                post = _http_get(f"https://{host}/api/v1/statuses/{status_id}", want_json=True)
+            except Exception as e:
+                log.warning("url door: %s api lookup failed: %s", host, e)
+                continue
+            caption = re.sub(r"<[^>]+>", " ", post.get("content") or "")
+            caption = " ".join(html.unescape(caption).split())
+            media = [m for m in (post.get("media_attachments") or [])
+                     if m.get("type") == "image" and m.get("url")]
+            for i, m in enumerate(media):
+                stem = f"{host.split('.')[0]}-{status_id}" + (f"-{i + 1}" if len(media) > 1 else "")
+                got = _fetch_image(m["url"], stem, into)
+                if got:
+                    found.append((got[0], got[1], (m.get("description") or "").strip(), caption))
+            continue
+
+        got = _fetch_image(url, Path(url.split("?")[0]).stem or "linked", into)
+        if got:
+            found.append((got[0], got[1], "", ""))
+    return found
+
+
 def _resolve_attachment(att: dict) -> Path | None:
     """Find the file signal-cli wrote for this attachment id. Retries briefly —
     the receive event can beat the file write."""
@@ -623,6 +705,24 @@ def process_drop(drop: dict, rpc: SignalRpc) -> None:
     keep: list[tuple[Path, str]] = []
     rejected: list[str] = []
     seen: set[str] = set()
+
+    # URL door: a link in the note stands in for an attachment. Fetched first so
+    # its name reserves a slot in `seen` alongside the Signal files.
+    alts: dict[str, str] = {}
+    caption = ""
+    fetch_dir = DROP_STAGING / f"fetch-{int(time.time())}"
+    try:
+        if URL_RE.search(drop["text"] or ""):
+            fetch_dir.mkdir(parents=True, exist_ok=True)
+            for path, name, alt, cap in fetch_from_urls(drop["text"], fetch_dir):
+                keep.append((path, name))
+                seen.add(name)
+                if alt:
+                    alts[name] = alt
+                caption = caption or cap
+    except Exception:
+        log.exception("url door failed (drop continues with its own files)")
+
     for att in drop["attachments"]:
         p = _resolve_attachment(att)
         raw = att.get("filename") or (p.name if p else str(att.get("id")))
@@ -639,7 +739,7 @@ def process_drop(drop: dict, rpc: SignalRpc) -> None:
         keep.append((p, name))
 
     file_drop(keep, rejected, drop["text"], _sender_tag(drop["sender"]),
-              drop["door"], _reply)
+              drop["door"], _reply, alts=alts, caption=caption)
 
 
 def _lfs_route(repo: Path, dest: Path, dest_rel: Path, big: list[str]) -> list[str]:
@@ -672,7 +772,7 @@ def _piece_title(text: str, fallback: str) -> tuple[str, str]:
     becomes the note; a bare long line falls back to a word-boundary trim rather
     than a slug nobody can read.
     """
-    cleaned = " ".join(DROP_TAG_RE.sub(" ", text or "").split())
+    cleaned = " ".join(URL_RE.sub(" ", DROP_TAG_RE.sub(" ", text or "")).split())
     if not cleaned:
         return fallback, ""
 
@@ -691,7 +791,8 @@ def _piece_title(text: str, fallback: str) -> tuple[str, str]:
 
 
 def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
-                       drop_id: str) -> list[str]:
+                       drop_id: str, alts: dict[str, str] | None = None,
+                       caption: str = "") -> list[str]:
     """Second leg for #lmsr drops: hang the images in the Galería de Guadalupe.
 
     Reuses the site's own scripts/add-piece.mjs so the resize and stub rules
@@ -714,11 +815,18 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
 
     _git(repo, "pull", "--rebase", "--autostash")
 
-    base, story = _piece_title(text, drop_id)
+    # A drop that is only a link has no words of its own — the toot's own text
+    # becomes the caption rather than falling back to the drop id.
+    base, story = _piece_title(text or "", "")
+    if not base:
+        base, story = _piece_title(caption, drop_id)
+
+    alts = alts or {}
     published: list[str] = []
     for i, name in enumerate(images):
         title = base if len(images) == 1 else f"{base} {i + 1}"
-        add = _run([BUN_BIN, "scripts/add-piece.mjs", str(dest / name), title, room],
+        add = _run([BUN_BIN, "scripts/add-piece.mjs", str(dest / name), title, room,
+                    alts.get(name, "")],
                    cwd=str(repo))
         if add.returncode != 0:
             log.error("add-piece failed for %s: %s", name, (add.stderr or "")[:300])
@@ -747,7 +855,8 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
 
 
 def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
-              sender: str, door: str, reply) -> None:
+              sender: str, door: str, reply, *,
+              alts: dict[str, str] | None = None, caption: str = "") -> None:
     """The door-agnostic spine: stage → commit → issue → manifest → reply.
     `keep` is [(local_path, dest_name)] already gated by the calling door;
     `reply` is a callable(message) for the door's confirmation channel."""
@@ -910,7 +1019,8 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
         hung: list[str] = []
         try:
             if LMSR_RE.search(text or ""):
-                hung = publish_to_galeria(dest, names, text, tags, drop_id)
+                hung = publish_to_galeria(dest, names, text, tags, drop_id,
+                                          alts=alts, caption=caption)
                 if hung and issue_url:
                     _run([GH_BIN, "issue", "comment", issue_url, "--body",
                           "👑 `#lmsr` — also hung in the Galería de Guadalupe: "
