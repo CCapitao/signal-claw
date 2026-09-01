@@ -81,6 +81,7 @@ DROP_INTAKE_CONFIG_DIR = env("DROP_INTAKE_CONFIG_DIR", "").strip()  # minimal in
 DROP_RELEASE_MB   = int(env("DROP_RELEASE_MB", "25"))    # bigger than this rides a release asset, not git
 SKULL_REPO        = env("SKULL_REPO", "").strip()        # local clone of skull-and-crown; empty = #lmsr fan-out off
 SKULL_GH_REPO     = env("SKULL_GH_REPO", "CCapitao/skull-and-crown")
+SKULL_SITE        = env("SKULL_SITE", "https://theskullandcrown.com").rstrip("/")
 BUN_BIN           = env("BUN_BIN", str(Path.home() / ".bun/bin/bun"))  # runs the site's own add-piece intake
 SIGNAL_ATTACH_DIR = Path(env("SIGNAL_ATTACH_DIR", str(Path.home() / ".local/share/signal-cli/attachments")))
 GH_BIN            = env("GH_BIN", "/usr/bin/gh")
@@ -832,7 +833,8 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
             log.error("add-piece failed for %s: %s", name, (add.stderr or "")[:300])
             continue
         slug = (add.stdout or "").strip().splitlines()[0].split("/")[-1]
-        published.append(f"{room}/{slug}")
+        # The live URL, not the slug — the point of the reply is to be tappable.
+        published.append(f"{SKULL_SITE}/galeria/{room}/{slug}")
         # The rest of the caption is the wall card's body — the piece keeps its
         # name in the URL, the Captain's words keep their place under it.
         if story:
@@ -1023,8 +1025,8 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
                                           alts=alts, caption=caption)
                 if hung and issue_url:
                     _run([GH_BIN, "issue", "comment", issue_url, "--body",
-                          "👑 `#lmsr` — also hung in the Galería de Guadalupe: "
-                          + ", ".join(f"`{p}`" for p in hung)
+                          "👑 `#lmsr` — also hung in the Galería de Guadalupe:\n\n"
+                          + "\n".join(f"- {p}" for p in hung)
                           + "\n\nReceipts remains the system of record; this is a"
                             " publish, not a promotion."])
         except Exception:
@@ -1033,7 +1035,8 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
         summary = (f"📥 {drop_id} filed · kind:{kind} · prod:{prod} · "
                    f"{len(names)} file(s) · {issue_url or '(issue failed — logged)'}")
         if hung:
-            summary += "\n👑 hung in the Galería: " + ", ".join(hung)
+            # On its own line and bare, so Signal renders it tappable.
+            summary += "\n\n👑 Hung in the Galería:\n" + "\n".join(hung)
         if rejected:
             summary += "\n⚠️ rejected: " + "; ".join(rejected[:3])
         if linked:
