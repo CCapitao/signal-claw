@@ -825,18 +825,23 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
     if not base:
         base, story = _piece_title(caption, "")
     if not base:
-        # All hashtags and nothing else: the tags ARE the caption. Drop the ones
-        # that steer the pipeline and keep whatever the Captain was naming.
-        control = GALLERY_ROOMS | DROP_KINDS | DROP_PRODS | {"lmsr", "drop"}
-        words = [t for t in DROP_TAG_RE.findall(text or "") if t.lower() not in control]
-        base = " ".join(words) or drop_id
+        # Ruled by Capitão 2026-09-08: "if it's just multiple # then that IS the
+        # content." Not a tag index to parse, rank, or tidy — his caption. The
+        # only thing removed is #lmsr, which is the publish switch rather than
+        # something he wrote about the work. Everything else stays verbatim,
+        # in his order, punctuation intact.
+        base = " ".join(re.sub(r"(?i)(?:^|\s)#lmsr\b", " ", text or "").split()) or drop_id
 
     alts = alts or {}
     published: list[str] = []
     for i, name in enumerate(images):
         title = base if len(images) == 1 else f"{base} {i + 1}"
+        # His hashtags travel with the piece as tags, exactly as typed.
+        his_tags = " ".join(
+            t for t in (text or "").split()
+            if t.startswith("#") and t.lower() != "#lmsr")
         add = _run([BUN_BIN, "scripts/add-piece.mjs", str(dest / name), title, room,
-                    alts.get(name, "")],
+                    alts.get(name, ""), his_tags],
                    cwd=str(repo))
         if add.returncode != 0:
             log.error("add-piece failed for %s: %s", name, (add.stderr or "")[:300])
