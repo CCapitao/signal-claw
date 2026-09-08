@@ -764,6 +764,17 @@ def _lfs_route(repo: Path, dest: Path, dest_rel: Path, big: list[str]) -> list[s
     return routed
 
 
+def _md_label(text: str) -> str:
+    """Escape a caption for use inside a markdown link label.
+
+    The Captain's captions are often pure hashtags — "#anastacia #28massive" —
+    and a leading '#' or a stray bracket would otherwise be read as markup.
+    This escapes the delimiters only; the words themselves are never altered.
+    """
+    out = re.sub(r"([\\`*_\[\]<>])", r"\\\1", text or "")
+    return out.replace("#", "\\#") or "the piece"
+
+
 def _piece_title(text: str, fallback: str) -> tuple[str, str]:
     """Split a drop note into (title, rest) for a gallery piece.
 
@@ -848,7 +859,9 @@ def publish_to_galeria(dest: Path, names: list[str], text: str, tags: set[str],
             continue
         slug = (add.stdout or "").strip().splitlines()[0].split("/")[-1]
         # The live URL, not the slug — the point of the reply is to be tappable.
-        published.append(f"{SKULL_SITE}/galeria/{room}/{slug}")
+        # (label, url) — the issue wants a markdown anchor, Signal wants a bare
+        # tappable URL. Carry both so neither has to be reconstructed.
+        published.append((title, f"{SKULL_SITE}/galeria/{room}/{slug}"))
         # The rest of the caption is the wall card's body — the piece keeps its
         # name in the URL, the Captain's words keep their place under it.
         if story:
@@ -1040,7 +1053,7 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
                 if hung and issue_url:
                     _run([GH_BIN, "issue", "comment", issue_url, "--body",
                           "👑 `#lmsr` — also hung in the Galería de Guadalupe:\n\n"
-                          + "\n".join(f"- {p}" for p in hung)
+                          + "\n".join(f"- [{_md_label(label)}]({url})" for label, url in hung)
                           + "\n\nReceipts remains the system of record; this is a"
                             " publish, not a promotion."])
         except Exception:
@@ -1050,7 +1063,9 @@ def file_drop(keep: list[tuple[Path, str]], rejected: list[str], text: str,
                    f"{len(names)} file(s) · {issue_url or '(issue failed — logged)'}")
         if hung:
             # On its own line and bare, so Signal renders it tappable.
-            summary += "\n\n👑 Hung in the Galería:\n" + "\n".join(hung)
+            # Signal renders no markdown — a bare URL on its own line is what
+            # makes it tappable there.
+            summary += "\n\n👑 Hung in the Galería:\n" + "\n".join(u for _, u in hung)
         if rejected:
             summary += "\n⚠️ rejected: " + "; ".join(rejected[:3])
         if linked:
